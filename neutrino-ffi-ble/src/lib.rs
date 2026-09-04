@@ -25,9 +25,9 @@ use relay_transport::{IrohTransport, RELAY_BIND};
 
 /// Fixed localpart for every embedded peer's user: user ids are
 /// `@n:{node_id}`. The discovery registry is localpart-agnostic — this is the
-/// BLE medium's convention, applied by its discovery drain (see
-/// `relay_transport`) where the node id is known.
-#[cfg(feature = "ble")]
+/// medium's convention, applied by whichever discovery drain (BLE or mDNS, see
+/// `relay_transport`) learned the node id.
+#[cfg(any(feature = "ble", feature = "mdns"))]
 pub(crate) const DISCOVERY_LOCALPART: &str = "n";
 
 /// Start the embedded homeserver with the iroh/BLE federation medium.

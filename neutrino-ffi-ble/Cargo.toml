@@ -28,7 +28,16 @@ tracing.workspace = true
 tokio.workspace = true
 uniffi.workspace = true
 
-iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
+iroh = { version = "0.98.2", features = [
+    "unstable-custom-transports",
+    # Link-local peer discovery, via `swarm-discovery`. Deliberately NOT the
+    # `N0` preset's pkarr publisher + DNS lookup: those point at
+    # `dns.iroh.link`, block on our `current_thread` runtime when offline, and
+    # are precisely what `Minimal` + `RelayMode::Disabled` exist to avoid here.
+    # mDNS is link-local and touches no internet service, so the offline
+    # guarantee survives.
+    "address-lookup-mdns",
+] }
 # BLE is the Android medium (`blew` over JNI); on Linux the transport's backend
 # is `bluer`, which needs system D-Bus/BlueZ. Gate it behind `ble` so the
 # default build (loopback tests, CI check) is iroh-only and needs no system
@@ -37,6 +46,10 @@ iroh-ble-transport = { path = "../vendor/iroh-ble-transport", optional = true }
 # `iroh::Connection::send_datagram` takes `bytes::Bytes`. Already in the tree
 # transitively via iroh, so no new compile cost.
 bytes = "1"
+# `MdnsAddressLookup::subscribe` yields an `n0_future::Stream`; this is iroh's
+# own futures crate, already in the tree transitively, so taking it directly
+# costs nothing and keeps the trait impls identical.
+n0-future = "0.3"
 # iroh unifies reqwest's TLS backend onto rustls with no default crypto
 # provider; `start_ble` installs the `ring` provider before the server builds
 # its federation client (which would otherwise panic). rustls + ring are
@@ -55,6 +68,14 @@ ndk-context = { version = "0.1", optional = true }
 
 [features]
 ble = ["dep:iroh-ble-transport", "dep:blew", "dep:jni", "dep:ndk-context"]
+# LAN peer discovery over mDNS. On by default and deliberately NOT implied by
+# `ble`: it is most useful where BLE is absent (desktop, CI), where it is the
+# only way two nodes find each other without hand-seeding addresses, and on
+# device it is what lets two handsets on the same Wi-Fi talk over Wi-Fi instead
+# of falling back to Bluetooth. Off with `--no-default-features` for a build
+# that must emit no multicast.
+mdns = []
+default = ["mdns"]
 
 [dev-dependencies]
 # The datagram-link test derives the expected node id from a secret to pin the

@@ -59,6 +59,32 @@ struct Args {
     /// (127.0.0.2, 127.0.0.3, …) gives them disjoint address sets, which is the
     /// closest a single machine gets to distinct peers.
     relay_bind: Option<SocketAddr>,
+    /// Peers to seed as `<64-hex-id>@<ip:port>`, repeatable.
+    ///
+    /// Discovery is link-local, so it finds nothing across a routed network,
+    /// and on a Wi-Fi that isolates clients it finds peers it cannot then
+    /// reach. An explicitly configured peer is how a node crosses either
+    /// boundary — and is the shape a venue gateway is configured with.
+    peers: Vec<([u8; 32], SocketAddr)>,
+}
+
+/// Parse `<64-hex>@<ip:port>`.
+fn parse_peer(spec: &str) -> Result<([u8; 32], SocketAddr), String> {
+    let (id, addr) = spec
+        .split_once('@')
+        .ok_or_else(|| format!("--peer {spec}: expected <64-hex-id>@<ip:port>"))?;
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("--peer {spec}: id must be 64 hex characters"));
+    }
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&id[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("--peer {spec}: {e}"))?;
+    }
+    let addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("--peer {spec}: bad address: {e}"))?;
+    Ok((key, addr))
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -71,7 +97,7 @@ fn parse_args() -> Result<Args, String> {
     };
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         return Err(format!(
-            "usage: {} --bind <addr:port> --storage <dir> --fed-port <port> \\\n            [--localpart n] [--server-name <name>]",
+            "usage: {} --bind <addr:port> --storage <dir> --fed-port <port> \\\n            [--relay-bind <ip:port>] [--peer <64hex>@<ip:port>]... [--localpart n]",
             argv.first().map(String::as_str).unwrap_or("neutrino-lan")
         ));
     }
@@ -87,8 +113,21 @@ fn parse_args() -> Result<Args, String> {
         localpart: get("--localpart").unwrap_or_else(|| "n".to_string()),
         server_name: get("--server-name"),
         fed_port,
+        peers: {
+            let mut out = Vec::new();
+            for (i, a) in argv.iter().enumerate() {
+                if a == "--peer" {
+                    let spec = argv.get(i + 1).ok_or("--peer needs a value")?;
+                    out.push(parse_peer(spec)?);
+                }
+            }
+            out
+        },
         relay_bind: match get("--relay-bind") {
-            Some(v) => Some(v.parse::<SocketAddr>().map_err(|e| format!("--relay-bind: {e}"))?),
+            Some(v) => Some(
+                v.parse::<SocketAddr>()
+                    .map_err(|e| format!("--relay-bind: {e}"))?,
+            ),
             None => None,
         },
     })
@@ -133,10 +172,10 @@ fn main() -> std::process::ExitCode {
         delivery_receipts: true,
     };
 
-    let handle = match args.relay_bind {
-        Some(addr) => neutrino_ble::start_lan_on(config, addr),
-        None => neutrino_ble::start_lan(config),
-    };
+    let relay_bind = args
+        .relay_bind
+        .unwrap_or_else(|| "0.0.0.0:0".parse().expect("wildcard"));
+    let handle = neutrino_ble::start_lan_with_peers(config, relay_bind, args.peers.clone());
 
     // Poll for readiness rather than sleeping a guess: the harness needs the
     // server name, and a start that refuses (e.g. the trust-domain guard on a

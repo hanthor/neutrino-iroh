@@ -506,6 +506,23 @@ impl IrohTransport {
         self.endpoint.bound_sockets()
     }
 
+    /// Seed a peer by raw node id and socket address.
+    ///
+    /// The public form of [`add_peer`](Self::add_peer) for callers that have a
+    /// configured peer rather than a discovered one — across a routed network,
+    /// or on a Wi-Fi whose AP isolates clients, where discovery cannot help.
+    pub fn seed_peer(&self, id: [u8; 32], addr: std::net::SocketAddr) {
+        match EndpointId::from_bytes(&id) {
+            Ok(eid) => {
+                tracing::info!(peer = %hex32(&id), %addr, "seeded configured peer");
+                self.add_peer(EndpointAddr::new(eid).with_ip_addr(addr));
+            }
+            // A malformed id is a config error the operator must see; refusing
+            // silently would look like an unreachable peer later.
+            Err(e) => tracing::error!(peer = %hex32(&id), %e, "configured peer id is invalid"),
+        }
+    }
+
     /// Teach the transport how to reach a peer. Keyed by the address's own
     /// endpoint id, so the mapping has a single source of truth.
     #[allow(dead_code)]

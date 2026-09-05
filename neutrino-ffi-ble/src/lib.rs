@@ -96,8 +96,25 @@ pub fn start_lan(config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHandle {
 /// port, which is not a topology iroh is designed for. A distinct loopback
 /// alias per node gives disjoint address sets.
 pub fn start_lan_on(
+    config: neutrino::NeutrinoConfig,
+    relay_bind: std::net::SocketAddr,
+) -> neutrino::NeutrinoHandle {
+    start_lan_with_peers(config, relay_bind, Vec::new())
+}
+
+/// [`start_lan_on`] with peers seeded explicitly, bypassing discovery.
+///
+/// mDNS is link-local, so it finds nothing across a routed network — and on a
+/// Wi-Fi with client isolation (the default on most guest and conference APs)
+/// peers cannot reach each other over the LAN at all, even on one subnet, while
+/// multicast still leaks enough for discovery to *look* healthy. Explicit peers
+/// are how a node reaches another across those boundaries, and they are the
+/// mechanism a venue gateway would be configured with: `[federation] peers` on
+/// the Spindle side has exactly this shape.
+pub fn start_lan_with_peers(
     mut config: neutrino::NeutrinoConfig,
     relay_bind: std::net::SocketAddr,
+    peers: Vec<([u8; 32], std::net::SocketAddr)>,
 ) -> neutrino::NeutrinoHandle {
     config.delivery_receipts = true;
     neutrino_main::init_tracing(config.log_dir.as_deref().map(std::path::Path::new));
@@ -113,6 +130,11 @@ pub fn start_lan_on(
     let factory: neutrino_main::FederationLinkFactory = Box::new(move |ctx| {
         Box::pin(async move {
             let transport = IrohTransport::bind(ctx, relay_bind).await?;
+            // Seeded before the link is handed over, so the first federation
+            // request already has an address and does not burn a dial timeout.
+            for (id, addr) in peers {
+                transport.seed_peer(id, addr);
+            }
             Ok(neutrino_main::FederationLink::new(
                 transport as std::sync::Arc<dyn neutrino_main::DatagramLink>,
             )

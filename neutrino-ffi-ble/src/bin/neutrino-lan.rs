@@ -25,6 +25,7 @@
 //! stdout once the server is ready, so a harness can key peers without parsing
 //! logs.
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 /// How long to wait for the server to report a `server_name` before giving up.
@@ -48,6 +49,16 @@ struct Args {
     /// The sidecar is what routes federation through the `DatagramLink`, i.e.
     /// over iroh.
     fed_port: u16,
+    /// Address the iroh endpoint binds its QUIC socket to.
+    ///
+    /// Defaults to the medium's `RELAY_BIND` (all interfaces), which is right
+    /// on a phone. On a rig running many nodes on one host it is not: every
+    /// node then advertises the *same* host addresses and differs only by port,
+    /// and iroh is built around one endpoint per host with per-address path
+    /// selection. Pointing each node at a distinct loopback alias
+    /// (127.0.0.2, 127.0.0.3, …) gives them disjoint address sets, which is the
+    /// closest a single machine gets to distinct peers.
+    relay_bind: Option<SocketAddr>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -76,6 +87,10 @@ fn parse_args() -> Result<Args, String> {
         localpart: get("--localpart").unwrap_or_else(|| "n".to_string()),
         server_name: get("--server-name"),
         fed_port,
+        relay_bind: match get("--relay-bind") {
+            Some(v) => Some(v.parse::<SocketAddr>().map_err(|e| format!("--relay-bind: {e}"))?),
+            None => None,
+        },
     })
 }
 
@@ -118,7 +133,10 @@ fn main() -> std::process::ExitCode {
         delivery_receipts: true,
     };
 
-    let handle = neutrino_ble::start_lan(config);
+    let handle = match args.relay_bind {
+        Some(addr) => neutrino_ble::start_lan_on(config, addr),
+        None => neutrino_ble::start_lan(config),
+    };
 
     // Poll for readiness rather than sleeping a guess: the harness needs the
     // server name, and a start that refuses (e.g. the trust-domain guard on a

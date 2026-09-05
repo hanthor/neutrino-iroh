@@ -85,7 +85,20 @@ pub fn start_ble(mut config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHand
 ///
 /// Not `#[uniffi::export]`ed: nothing across the FFI wants it, and exporting a
 /// second entrypoint would put a desktop-only path in the Kotlin surface.
-pub fn start_lan(mut config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHandle {
+pub fn start_lan(config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHandle {
+    start_lan_on(config, RELAY_BIND)
+}
+
+/// [`start_lan`] with an explicit QUIC bind address.
+///
+/// Exists for test rigs that run many nodes on one host: bound to the default
+/// wildcard every node advertises the same host addresses and differs only by
+/// port, which is not a topology iroh is designed for. A distinct loopback
+/// alias per node gives disjoint address sets.
+pub fn start_lan_on(
+    mut config: neutrino::NeutrinoConfig,
+    relay_bind: std::net::SocketAddr,
+) -> neutrino::NeutrinoHandle {
     config.delivery_receipts = true;
     neutrino_main::init_tracing(config.log_dir.as_deref().map(std::path::Path::new));
     tracing::info!(
@@ -99,7 +112,7 @@ pub fn start_lan(mut config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHand
     let _ = rustls::crypto::ring::default_provider().install_default();
     let factory: neutrino_main::FederationLinkFactory = Box::new(move |ctx| {
         Box::pin(async move {
-            let transport = IrohTransport::bind(ctx, RELAY_BIND).await?;
+            let transport = IrohTransport::bind(ctx, relay_bind).await?;
             Ok(neutrino_main::FederationLink::new(
                 transport as std::sync::Arc<dyn neutrino_main::DatagramLink>,
             )

@@ -19,11 +19,13 @@ name = "neutrino_ble"
 # The composition targets: the FFI surface this crate re-exports an entrypoint
 # for, and the seam types (`FederationLinkFactory`, `LinkContext`,
 # `DatagramLink`).
-# Pointed at the fork's room-aliases branch: upstream v0.7.1 has no alias
-# support at all, so a mesh node cannot resolve the deterministic conference
-# aliases the companion emits. Revert to the tag once that lands upstream.
-neutrino-ffi = { git = "https://github.com/hanthor/neutrino", branch = "room-aliases" }
-neutrino-main = { git = "https://github.com/hanthor/neutrino", branch = "room-aliases" }
+# Pointed at the fork's e2ee-key-transport branch — the branch the companion
+# pins, now carrying room aliases (hanthor/neutrino#1). Upstream v0.7.1 has no
+# alias support at all, so a mesh node cannot resolve the deterministic
+# conference aliases the companion emits. Revert to the tag once that lands
+# upstream.
+neutrino-ffi = { git = "https://github.com/hanthor/neutrino", branch = "e2ee-key-transport" }
+neutrino-main = { git = "https://github.com/hanthor/neutrino", branch = "e2ee-key-transport" }
 
 # `neutrino_main::DatagramLink` is an `#[async_trait]` trait we implement over iroh.
 async-trait.workspace = true

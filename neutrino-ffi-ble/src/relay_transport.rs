@@ -134,6 +134,18 @@ fn spawn_mdns_drain(
     use n0_future::StreamExt;
 
     tokio::spawn(async move {
+        // Peers a probe has actually reached. Shared, because the probe runs
+        // off-task: dialing takes up to CONNECT_TIMEOUT and must not stall the
+        // drain, which is the only thing keeping addresses fresh. Reaching a
+        // peer is terminal — the point is to stop probing, not to track
+        // liveness, which the datagram link finds out about when it matters.
+        let reachable: Arc<std::sync::Mutex<std::collections::HashSet<NodeKey>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // When each unreachable peer was last probed, so a peer that is
+        // announcing but not accepting is retried without dialing it once a
+        // second for as long as it is up.
+        let mut probed: std::collections::HashMap<NodeKey, std::time::Instant> =
+            std::collections::HashMap::new();
         let mut events = mdns.subscribe().await;
         while let Some(event) = events.next().await {
             // A dropped transport means the link is gone; stop draining.
@@ -170,7 +182,8 @@ fn spawn_mdns_drain(
                     }
                     tp.add_peer(addr);
                     registry.upsert(
-                        server_name,
+                        // Cloned: the probe below reports under the same name.
+                        server_name.clone(),
                         neutrino_main::DiscoveredPeer {
                             localpart: crate::DISCOVERY_LOCALPART.to_string(),
                             // mDNS carries no display name for us; the peer's
@@ -185,6 +198,61 @@ fn spawn_mdns_drain(
                         // A peer that appeared while a destination was backed
                         // off should be retried now, not after the backoff.
                         let _ = kick.send(neutrino_main::Command::KickBackoff);
+                    }
+                    // Probe on first sight, and keep retrying — at a bounded
+                    // rate — until one succeeds.
+                    let known_reachable = reachable
+                        .lock()
+                        .map(|r| r.contains(&key))
+                        .unwrap_or(false);
+                    let due = !known_reachable
+                        && probed
+                            .get(&key)
+                            .is_none_or(|at| at.elapsed() >= PROBE_RETRY_INTERVAL);
+                    if due {
+                        probed.insert(key, std::time::Instant::now());
+                        // Dial it straight away rather than leaving the first
+                        // real request to find out whether it can be reached.
+                        //
+                        // Discovering a peer is not the same as being able to
+                        // reach it, and until something dials, nothing knows
+                        // which of the two it has. On a cold start the address
+                        // is announced before the peer will accept, so the
+                        // first federation request pays the full connect
+                        // timeout and fails — one invite per run, at any swarm
+                        // size. On a Wi-Fi that isolates clients the multicast
+                        // arrives while unicast is blocked, so discovery keeps
+                        // succeeding for a peer that can never be reached.
+                        //
+                        // Probing turns both into a warm connection or an early
+                        // log line, instead of a minute of silence inside
+                        // somebody's invite. The connection is cached, so a
+                        // successful probe is not wasted work — it is the dial
+                        // the first request would have done, moved to where
+                        // waiting costs nothing.
+                        let probe = Arc::clone(&tp);
+                        let reached = Arc::clone(&reachable);
+                        tokio::spawn(async move {
+                            match probe.connection(key).await {
+                                Ok(_) => {
+                                    if let Ok(mut r) = reached.lock() {
+                                        r.insert(key);
+                                    }
+                                    tracing::info!(
+                                        peer = %server_name,
+                                        "mdns: peer reachable (probe connected)"
+                                    );
+                                }
+                                // Not a warning: on a mesh this is ordinary and
+                                // self-correcting — the peer may still be
+                                // starting, and the next announce probes again.
+                                Err(e) => tracing::info!(
+                                    peer = %server_name,
+                                    error = %e,
+                                    "mdns: peer discovered but not reachable yet"
+                                ),
+                            }
+                        });
                     }
                 }
                 iroh::address_lookup::DiscoveryEvent::Expired { endpoint_id } => {
@@ -276,6 +344,14 @@ fn now_ms() -> u64 {
 /// for a real BLE discovery + QUIC handshake, short enough to surface a dead peer
 /// well before the coap request timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait before probing a discovered-but-unreachable peer again.
+///
+/// mDNS re-announces about once a second for as long as a peer is up, and a
+/// peer that is announcing but not yet accepting would otherwise be dialed at
+/// that rate for its whole life. Long enough to be quiet, short enough that a
+/// peer which becomes reachable is noticed well before anyone tries to use it.
+const PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Connection-level QUIC idle timeout. iroh's default is 30s (noq-proto,
 /// RFC 9308 §3.2); iroh overrides the *path* idle (15s) and keepalive (5s) but

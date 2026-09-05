@@ -100,6 +100,106 @@ fn spawn_discovery_drain(
     });
 }
 
+/// Forward mDNS-discovered LAN peers into the transport and the homeserver's
+/// discovery registry.
+///
+/// This is the LAN twin of [`spawn_discovery_drain`], and it exists because
+/// until now nothing seeded an IP address on a real device: BLE peers were
+/// discovered by advertising, while LAN peers could only arrive through
+/// `add_peer`, which had no caller outside the tests. Two handsets on the same
+/// Wi-Fi therefore found each other over Bluetooth and sent everything over it,
+/// which is the slowest transport available to them.
+///
+/// Seeding `add_peer` is what actually changes behaviour: the dial path prefers
+/// a seeded address over `address_lookup`, and without the `ble` feature an
+/// unseeded peer fails fast rather than being resolved at all.
+///
+/// Two differences from the BLE drain, both deliberate:
+///
+/// * It writes with `upsert`/incremental events rather than `replace`, because
+///   mDNS reports peers one at a time rather than as a scan snapshot.
+/// * With the `ble` feature also on, the BLE drain's `replace` will transiently
+///   drop mDNS entries from the *registry* (it rewrites the whole set from its
+///   own snapshot). That affects the peer directory only — the seeded address
+///   lives in this transport's own `addrs` map and is untouched, so dialling a
+///   LAN peer keeps working. Merging both sources behind one writer is the
+///   proper fix and wants its own change.
+#[cfg(feature = "mdns")]
+fn spawn_mdns_drain(
+    mdns: iroh::address_lookup::MdnsAddressLookup,
+    transport: std::sync::Weak<IrohTransport>,
+    registry: Arc<neutrino_main::DiscoveryRegistry>,
+    kick: mpsc::UnboundedSender<neutrino_main::Command>,
+) {
+    use n0_future::StreamExt;
+
+    tokio::spawn(async move {
+        let mut events = mdns.subscribe().await;
+        while let Some(event) = events.next().await {
+            // A dropped transport means the link is gone; stop draining.
+            let Some(tp) = transport.upgrade() else {
+                return;
+            };
+            match event {
+                iroh::address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                    let id = endpoint_info.endpoint_id;
+                    let key = *id.as_bytes();
+                    let server_name = hex32(&key);
+                    // Never seed ourselves: an endpoint hears its own advert.
+                    if tp.node_key() == key {
+                        continue;
+                    }
+                    let addr: EndpointAddr = endpoint_info.into();
+                    // No addresses means nothing to dial — an advert we cannot
+                    // act on, so do not claim the peer is reachable.
+                    if addr.addrs.is_empty() {
+                        continue;
+                    }
+                    // mDNS re-announces continuously — a peer is "discovered"
+                    // roughly once a second for as long as it is up. Seeding
+                    // and upserting every time is cheap and keeps the address
+                    // fresh, but logging every time is not: on a handset it
+                    // would bury logcat (a small ring buffer that also drops
+                    // lines from chatty UIDs) and hide the events that matter.
+                    // Announce a peer once, then stay quiet about it.
+                    let fresh = registry.get(&server_name).is_none();
+                    if fresh {
+                        tracing::info!(peer = %server_name, ?addr, "mdns: LAN peer discovered");
+                    } else {
+                        tracing::trace!(peer = %server_name, "mdns: re-announce");
+                    }
+                    tp.add_peer(addr);
+                    registry.upsert(
+                        server_name,
+                        neutrino_main::DiscoveredPeer {
+                            localpart: crate::DISCOVERY_LOCALPART.to_string(),
+                            // mDNS carries no display name for us; the peer's
+                            // own `/profile` is the source of truth once it is
+                            // reachable, and an empty name is how the registry
+                            // already represents "not yet known".
+                            display_name: String::new(),
+                            last_seen_ms: now_ms(),
+                        },
+                    );
+                    if fresh {
+                        // A peer that appeared while a destination was backed
+                        // off should be retried now, not after the backoff.
+                        let _ = kick.send(neutrino_main::Command::KickBackoff);
+                    }
+                }
+                iroh::address_lookup::DiscoveryEvent::Expired { endpoint_id } => {
+                    // Leave the seeded address in place: an expiry means the
+                    // advert stopped, not that the address became wrong, and a
+                    // stale address costs one failed dial whereas dropping it
+                    // costs the ability to reach a peer that is still there.
+                    tracing::debug!(peer = %hex32(endpoint_id.as_bytes()), "mdns: advert expired");
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
 /// Re-advertise the local display name whenever it changes (`PUT
 /// /profile/.../displayname` pulses the watch).
 #[cfg(feature = "ble")]
@@ -161,7 +261,7 @@ fn unhex32(addr: &[u8]) -> std::io::Result<NodeKey> {
 }
 
 /// Wall-clock milliseconds since the Unix epoch (0 if the clock is before it).
-#[cfg(feature = "ble")]
+#[cfg(any(feature = "ble", feature = "mdns"))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -231,8 +331,12 @@ impl IrohTransport {
             commands,
             ..
         } = ctx;
+        // `name_rx` drives the BLE advert only. `discovery`/`commands` are used
+        // by whichever discovery drain is compiled in — BLE's, mDNS's, or both.
         #[cfg(not(feature = "ble"))]
-        let _ = (name_rx, discovery, commands);
+        let _ = name_rx;
+        #[cfg(not(any(feature = "ble", feature = "mdns")))]
+        let _ = (&discovery, &commands);
         let secret_key = SecretKey::from_bytes(&secret);
         // The BLE transport needs our public key; capture it before the key is
         // moved into the builder.
@@ -307,7 +411,13 @@ impl IrohTransport {
             // Publish peers the transport scans into the homeserver's registry
             // (kicking backed-off destinations when one appears), and
             // re-advertise our name when it changes.
-            spawn_discovery_drain(ble.discovered_peers(), discovery, commands);
+            // Cloned, not moved: with `mdns` also on, the LAN drain below needs
+            // the same registry and command sender.
+            spawn_discovery_drain(
+                ble.discovered_peers(),
+                Arc::clone(&discovery),
+                commands.clone(),
+            );
             spawn_readvertise(Arc::clone(&ble), name_rx);
             let ble: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble;
             tracing::info!("BLE dedup hook wired: verified-endpoint events -> registry");
@@ -338,14 +448,42 @@ impl IrohTransport {
             conns.clone(),
             inbound_tx.clone(),
         ));
-        Ok(Arc::new(Self {
+        let transport = Arc::new(Self {
             endpoint,
             conns,
             addrs: Mutex::new(HashMap::new()),
             inbound_tx,
             inbound_rx: AsyncMutex::new(inbound_rx),
             accept_task: Mutex::new(Some(accept_task)),
-        }))
+        });
+
+        // LAN discovery. Registered *after* bind and via `AddressLookupServices`
+        // rather than on the builder, so one call covers both the BLE and
+        // non-BLE paths above; `address_lookup` is additive on both, so this
+        // sits alongside the BLE lookup rather than replacing it.
+        #[cfg(feature = "mdns")]
+        {
+            let id = transport.endpoint.id();
+            match iroh::address_lookup::MdnsAddressLookup::builder().build(id) {
+                Ok(mdns) => {
+                    transport
+                        .endpoint
+                        .address_lookup()
+                        .map(|svcs| svcs.add(mdns.clone()))
+                        // A closed endpoint here would mean bind raced a
+                        // shutdown; nothing to recover, just skip discovery.
+                        .unwrap_or_else(|e| tracing::warn!(?e, "mdns: endpoint closed"));
+                    spawn_mdns_drain(mdns, Arc::downgrade(&transport), discovery, commands);
+                    tracing::info!("mdns: LAN discovery active");
+                }
+                // No IPv4 and no IPv6 is the documented failure. The mesh still
+                // works over BLE (or seeded addresses); it just will not find
+                // LAN peers, so warn rather than fail the whole link.
+                Err(e) => tracing::warn!(?e, "mdns: LAN discovery unavailable"),
+            }
+        }
+
+        Ok(transport)
     }
 
     /// This node's identity (its iroh endpoint id) as a [`NodeKey`].
@@ -366,6 +504,23 @@ impl IrohTransport {
     #[allow(dead_code)]
     pub(crate) fn bound_sockets(&self) -> Vec<SocketAddr> {
         self.endpoint.bound_sockets()
+    }
+
+    /// Seed a peer by raw node id and socket address.
+    ///
+    /// The public form of [`add_peer`](Self::add_peer) for callers that have a
+    /// configured peer rather than a discovered one — across a routed network,
+    /// or on a Wi-Fi whose AP isolates clients, where discovery cannot help.
+    pub fn seed_peer(&self, id: [u8; 32], addr: std::net::SocketAddr) {
+        match EndpointId::from_bytes(&id) {
+            Ok(eid) => {
+                tracing::info!(peer = %hex32(&id), %addr, "seeded configured peer");
+                self.add_peer(EndpointAddr::new(eid).with_ip_addr(addr));
+            }
+            // A malformed id is a config error the operator must see; refusing
+            // silently would look like an unreachable peer later.
+            Err(e) => tracing::error!(peer = %hex32(&id), %e, "configured peer id is invalid"),
+        }
     }
 
     /// Teach the transport how to reach a peer. Keyed by the address's own
@@ -666,6 +821,70 @@ mod tests {
             .expect("A link open");
         assert_eq!(src, b_addr);
         assert_eq!(got, to_a);
+    }
+
+    // Two nodes find each other over the LAN with nothing seeded by hand.
+    //
+    // This is the property the whole mDNS change exists for: before it, the
+    // only way a peer's IP address entered `addrs` was a test calling
+    // `add_peer`, so two devices on one Wi-Fi could not reach each other over
+    // it at all. Here neither side is told anything about the other — both are
+    // bound, and the assertion is that discovery alone makes A able to send to
+    // B.
+    //
+    // Ignored by default: it needs a real multicast-capable interface, which a
+    // sandboxed or network-isolated CI runner does not have, and a test that
+    // silently passes because nothing was discovered would be worse than no
+    // test. Run it with `cargo test -- --ignored` on a machine with a LAN.
+    #[cfg(feature = "mdns")]
+    #[tokio::test]
+    #[ignore = "needs a multicast-capable network interface"]
+    async fn peers_discover_each_other_over_mdns_without_seeding() {
+        let any: SocketAddr = "0.0.0.0:0".parse().expect("wildcard");
+        // Keep A's registry so the drain's write can be asserted, not assumed.
+        let a_registry = Arc::new(neutrino_main::DiscoveryRegistry::new());
+        let a_ctx = LinkContext {
+            secret: [11u8; 32],
+            display_name: tokio::sync::watch::channel(String::new()).1,
+            discovery: Arc::clone(&a_registry),
+            commands: mpsc::unbounded_channel().0,
+        };
+        let a_tp = IrohTransport::bind(a_ctx, any).await.expect("bind A");
+        let b_tp = IrohTransport::bind(test_ctx([12u8; 32]), any)
+            .await
+            .expect("bind B");
+        let b_addr = hex32(&b_tp.node_key()).into_bytes();
+
+        // Deliberately no `add_peer` on either side.
+        //
+        // Poll rather than sleep a fixed span: mDNS advertise/browse timing is
+        // not deterministic, and a fixed wait either flakes or is needlessly
+        // slow. 30 s is generous for link-local discovery.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut sent = false;
+        while tokio::time::Instant::now() < deadline {
+            if a_tp.send(&b_addr, b"hello-over-lan").await.is_ok() {
+                sent = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(sent, "A never discovered B over mDNS");
+
+        let (src, got) = timeout(Duration::from_secs(10), b_tp.recv())
+            .await
+            .expect("B receives in time")
+            .expect("B link open");
+        assert_eq!(src, hex32(&a_tp.node_key()).into_bytes());
+        assert_eq!(got, b"hello-over-lan");
+
+        // Dialability is the headline, but the peer must also land in the
+        // registry the host's directory reads, or it never appears in a peer
+        // list even though it is reachable.
+        assert!(
+            a_registry.get(&hex32(&b_tp.node_key())).is_some(),
+            "discovered peer is dialable but missing from the discovery registry"
+        );
     }
 
     // The one error the transport itself originates: a destination with no

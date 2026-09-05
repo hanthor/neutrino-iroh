@@ -72,3 +72,39 @@ pub fn start_ble(mut config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHand
     // neutrino builds the runtime and opens the store itself.
     neutrino::start_with(config, None, None, Some(factory))
 }
+
+/// Start the embedded homeserver with the iroh medium on a machine that is not
+/// a phone — same composition as [`start_ble`], minus BLE.
+///
+/// This is what makes the medium testable. Off Android the `ble` feature is
+/// absent (its backend needs JNI, or D-Bus/BlueZ on Linux), so the endpoint is
+/// IP-only: QUIC over whatever interfaces are up, with peers found by mDNS. Two
+/// of these on one LAN discover each other and federate, which is the only way
+/// to exercise discovery, path selection and the CoAP framing without two
+/// handsets in hand.
+///
+/// Not `#[uniffi::export]`ed: nothing across the FFI wants it, and exporting a
+/// second entrypoint would put a desktop-only path in the Kotlin surface.
+pub fn start_lan(mut config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHandle {
+    config.delivery_receipts = true;
+    neutrino_main::init_tracing(config.log_dir.as_deref().map(std::path::Path::new));
+    tracing::info!(
+        neutrino_commit = env!("NEUTRINO_COMMIT"),
+        ble = cfg!(feature = "ble"),
+        "neutrino LAN medium starting"
+    );
+    // Same rustls provider requirement as `start_ble`: iroh unifies reqwest onto
+    // rustls with no default provider, and the federation client would panic
+    // without one. Idempotent.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let factory: neutrino_main::FederationLinkFactory = Box::new(move |ctx| {
+        Box::pin(async move {
+            let transport = IrohTransport::bind(ctx, RELAY_BIND).await?;
+            Ok(neutrino_main::FederationLink::new(
+                transport as std::sync::Arc<dyn neutrino_main::DatagramLink>,
+            )
+            .with_key_resolver(std::sync::Arc::new(neutrino_main::NodeIdKeyResolver)))
+        })
+    });
+    neutrino::start_with(config, None, None, Some(factory))
+}

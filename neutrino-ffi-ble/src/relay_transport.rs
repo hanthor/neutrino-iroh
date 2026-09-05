@@ -155,9 +155,20 @@ fn spawn_mdns_drain(
                     if addr.addrs.is_empty() {
                         continue;
                     }
-                    tracing::info!(peer = %server_name, ?addr, "mdns: LAN peer discovered");
-                    tp.add_peer(addr);
+                    // mDNS re-announces continuously — a peer is "discovered"
+                    // roughly once a second for as long as it is up. Seeding
+                    // and upserting every time is cheap and keeps the address
+                    // fresh, but logging every time is not: on a handset it
+                    // would bury logcat (a small ring buffer that also drops
+                    // lines from chatty UIDs) and hide the events that matter.
+                    // Announce a peer once, then stay quiet about it.
                     let fresh = registry.get(&server_name).is_none();
+                    if fresh {
+                        tracing::info!(peer = %server_name, ?addr, "mdns: LAN peer discovered");
+                    } else {
+                        tracing::trace!(peer = %server_name, "mdns: re-announce");
+                    }
+                    tp.add_peer(addr);
                     registry.upsert(
                         server_name,
                         neutrino_main::DiscoveredPeer {

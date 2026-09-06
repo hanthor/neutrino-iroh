@@ -67,9 +67,16 @@ jobs:
         run: |
           mkdir -p swift/headers
           cp swift/generated/*.h swift/headers/
+          # Two modules, named exactly as the generated Swift's guarded
+          # imports expect (`#if canImport(neutrinoFFI)` / `neutrino_bleFFI`)
+          # — a single umbrella module under any other name makes those
+          # imports silently drop and every FFI symbol go unresolved.
           cat > swift/headers/module.modulemap <<'EOF'
-          module NeutrinoFFI {
+          module neutrinoFFI {
             header "neutrinoFFI.h"
+            export *
+          }
+          module neutrino_bleFFI {
             header "neutrino_bleFFI.h"
             export *
           }

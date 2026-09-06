@@ -20,6 +20,7 @@ uniffi::setup_scaffolding!("neutrino_ble");
 #[cfg(feature = "ble")]
 mod ble_android;
 mod relay_transport;
+mod sim_link;
 
 use relay_transport::{IrohTransport, RELAY_BIND};
 
@@ -129,6 +130,20 @@ pub fn start_lan_with_peers(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let factory: neutrino_main::FederationLinkFactory = Box::new(move |ctx| {
         Box::pin(async move {
+            // NEUTRINO_SIM_LINK=1: swap the iroh medium for the plain-UDP test
+            // link, so a fault-injection harness's impairment proxy is the
+            // authoritative path (iroh would exchange address candidates and
+            // migrate the connection off the proxy — see sim_link.rs). The
+            // seeded peer addresses then point at the proxy, not the peer.
+            if std::env::var_os("NEUTRINO_SIM_LINK").is_some_and(|v| v == "1") {
+                let our_id = iroh::SecretKey::from_bytes(&ctx.secret).public();
+                let transport =
+                    sim_link::SimUdpLink::bind(*our_id.as_bytes(), relay_bind, peers).await?;
+                return Ok(neutrino_main::FederationLink::new(
+                    transport as std::sync::Arc<dyn neutrino_main::DatagramLink>,
+                )
+                .with_key_resolver(std::sync::Arc::new(neutrino_main::NodeIdKeyResolver)));
+            }
             let transport = IrohTransport::bind(ctx, relay_bind).await?;
             // Seeded before the link is handed over, so the first federation
             // request already has an address and does not burn a dial timeout.

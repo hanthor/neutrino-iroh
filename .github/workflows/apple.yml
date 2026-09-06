@@ -1,0 +1,116 @@
+# Build the mesh medium for Apple platforms, and prove it runs there.
+#
+# Three artifacts, one proof:
+#  - static libraries for iOS device (aarch64-apple-ios) and simulator
+#    (aarch64-apple-ios-sim), folded into NeutrinoKit.xcframework;
+#  - the uniffi-generated Swift bindings for both namespaces;
+#  - and — the part no cross-check from Linux can give — the embedded
+#    homeserver actually *started on the runner's own Apple silicon*
+#    (aarch64-apple-darwin), its client-server API answering over HTTP.
+#    macOS is not iOS, but every line of our code is the same on both;
+#    what differs (backgrounding, entitlements) is app-level and waits
+#    for a device.
+#
+# Runs on version.json-less cadence: every push to main and by hand.
+name: Apple targets
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'neutrino-ffi-ble/**'
+      - 'Cargo.lock'
+      - 'swift/**'
+      - '.github/workflows/apple.yml'
+permissions:
+  contents: write
+concurrency:
+  group: apple-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  xcframework:
+    name: XCFramework + run on Apple silicon
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain and Apple targets
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the static libraries
+        # No `ble`: that feature is Android JNI (with a Linux dev backend) and
+        # its absence is what makes these targets build at all. The default
+        # `mdns` feature stays — Wi-Fi discovery is exactly what an iPhone
+        # would use, entitlement permitting.
+        run: |
+          cargo build --release -p neutrino-ffi-ble --target aarch64-apple-ios
+          cargo build --release -p neutrino-ffi-ble --target aarch64-apple-ios-sim
+          cargo build --release -p neutrino-ffi-ble --target aarch64-apple-darwin
+
+      - name: Generate the Swift bindings
+        # Library mode over the *host* dylib: the metadata is identical across
+        # targets, and the host build is the one uniffi can dlopen.
+        run: |
+          cargo build --release -p neutrino-ffi-ble
+          cargo run --release -p uniffi-bindgen -- generate \
+            --library target/release/libneutrino_ble.dylib \
+            --language swift --out-dir swift/generated
+
+      - name: Assemble the XCFramework
+        # One headers dir carrying both namespaces' headers and a single
+        # umbrella modulemap — xcodebuild accepts one modulemap per library.
+        run: |
+          mkdir -p swift/headers
+          cp swift/generated/*.h swift/headers/
+          cat > swift/headers/module.modulemap <<'EOF'
+          module NeutrinoFFI {
+            header "neutrinoFFI.h"
+            header "neutrino_bleFFI.h"
+            export *
+          }
+          EOF
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libneutrino_ble.a -headers swift/headers \
+            -library target/aarch64-apple-ios-sim/release/libneutrino_ble.a -headers swift/headers \
+            -output NeutrinoKit.xcframework
+          du -sh NeutrinoKit.xcframework
+
+      - name: Run the node on this Mac
+        # The proof: compile the generated Swift against the darwin static
+        # library, start the embedded homeserver, and require its
+        # client-server API to answer. If this passes, the code that would
+        # run inside an iPhone app has run on Apple silicon.
+        run: |
+          swiftc -O -o swift/proof/run \
+            swift/proof/main.swift swift/generated/neutrino.swift swift/generated/neutrino_ble.swift \
+            -I swift/headers \
+            -import-objc-header swift/proof/bridging.h \
+            target/aarch64-apple-darwin/release/libneutrino_ble.a \
+            -framework Security -framework SystemConfiguration -framework CoreFoundation
+          ./swift/proof/run
+
+      - name: Upload the artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeutrinoKit-${{ github.sha }}
+          path: |
+            NeutrinoKit.xcframework
+            swift/generated
+
+      - name: Publish a release on main
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="neutrino-kit-$(git rev-parse --short HEAD)"
+          zip -qr NeutrinoKit.xcframework.zip NeutrinoKit.xcframework
+          (cd swift/generated && zip -qr ../../NeutrinoKit-swift.zip .)
+          shasum -a 256 NeutrinoKit.xcframework.zip NeutrinoKit-swift.zip > NeutrinoKit.sha256
+          gh release create "$tag" --notes "NeutrinoKit for iOS (device+simulator) at $(git rev-parse --short HEAD); Swift bindings; built and runtime-proven on macOS runners." \
+            NeutrinoKit.xcframework.zip NeutrinoKit-swift.zip NeutrinoKit.sha256 || \
+          gh release upload "$tag" NeutrinoKit.xcframework.zip NeutrinoKit-swift.zip NeutrinoKit.sha256 --clobber

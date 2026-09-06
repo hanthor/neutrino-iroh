@@ -141,11 +141,12 @@ fn spawn_mdns_drain(
         // liveness, which the datagram link finds out about when it matters.
         let reachable: Arc<std::sync::Mutex<std::collections::HashSet<NodeKey>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        // When each unreachable peer was last probed, so a peer that is
-        // announcing but not accepting is retried without dialing it once a
-        // second for as long as it is up.
+        // Per-peer probe state: when it was last dialed, and how many dials in
+        // a row have failed — the failure count sets an exponential backoff.
         let mut probed: std::collections::HashMap<NodeKey, std::time::Instant> =
             std::collections::HashMap::new();
+        let failures: Arc<std::sync::Mutex<std::collections::HashMap<NodeKey, u32>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut events = mdns.subscribe().await;
         while let Some(event) = events.next().await {
             // A dropped transport means the link is gone; stop draining.
@@ -205,10 +206,12 @@ fn spawn_mdns_drain(
                         .lock()
                         .map(|r| r.contains(&key))
                         .unwrap_or(false);
+                    let strikes = failures.lock().map(|f| f.get(&key).copied().unwrap_or(0)).unwrap_or(0);
+                    let wait = PROBE_RETRY_INTERVAL
+                        .saturating_mul(1u32 << strikes.min(6))
+                        .min(PROBE_RETRY_CAP);
                     let due = !known_reachable
-                        && probed
-                            .get(&key)
-                            .is_none_or(|at| at.elapsed() >= PROBE_RETRY_INTERVAL);
+                        && probed.get(&key).is_none_or(|at| at.elapsed() >= wait);
                     if due {
                         probed.insert(key, std::time::Instant::now());
                         // Dial it straight away rather than leaving the first
@@ -232,11 +235,15 @@ fn spawn_mdns_drain(
                         // waiting costs nothing.
                         let probe = Arc::clone(&tp);
                         let reached = Arc::clone(&reachable);
+                        let strike_book = Arc::clone(&failures);
                         tokio::spawn(async move {
                             match probe.connection(key).await {
                                 Ok(_) => {
                                     if let Ok(mut r) = reached.lock() {
                                         r.insert(key);
+                                    }
+                                    if let Ok(mut f) = strike_book.lock() {
+                                        f.remove(&key);
                                     }
                                     tracing::info!(
                                         peer = %server_name,
@@ -246,11 +253,16 @@ fn spawn_mdns_drain(
                                 // Not a warning: on a mesh this is ordinary and
                                 // self-correcting — the peer may still be
                                 // starting, and the next announce probes again.
-                                Err(e) => tracing::info!(
-                                    peer = %server_name,
-                                    error = %e,
-                                    "mdns: peer discovered but not reachable yet"
-                                ),
+                                Err(e) => {
+                                    if let Ok(mut f) = strike_book.lock() {
+                                        *f.entry(key).or_insert(0) += 1;
+                                    }
+                                    tracing::info!(
+                                        peer = %server_name,
+                                        error = %e,
+                                        "mdns: peer discovered but not reachable yet"
+                                    );
+                                }
                             }
                         });
                     }
@@ -345,13 +357,19 @@ fn now_ms() -> u64 {
 /// well before the coap request timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait before probing a discovered-but-unreachable peer again.
+/// First retry delay for a discovered-but-unreachable peer, doubled per
+/// failure up to [`PROBE_RETRY_CAP`].
 ///
-/// mDNS re-announces about once a second for as long as a peer is up, and a
-/// peer that is announcing but not yet accepting would otherwise be dialed at
-/// that rate for its whole life. Long enough to be quiet, short enough that a
-/// peer which becomes reachable is noticed well before anyone tries to use it.
+/// The floor matters at startup — a peer announced before it accepts becomes
+/// reachable seconds later, and waiting minutes for it would reintroduce the
+/// cold-start dial timeout the probe exists to prevent. The cap matters for
+/// the rest of the day: a venue AP that isolates clients leaves peers
+/// discoverable andfor ever undialable, and without a ceiling every phone would burn
+/// a 30-second dial against every such peer every few seconds, for hours, on
+/// battery. Measured before the cap existed: a test node redialed one
+/// unreachable gateway every ~10 seconds for the whole session.
 const PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const PROBE_RETRY_CAP: Duration = Duration::from_secs(300);
 
 /// Connection-level QUIC idle timeout. iroh's default is 30s (noq-proto,
 /// RFC 9308 §3.2); iroh overrides the *path* idle (15s) and keepalive (5s) but

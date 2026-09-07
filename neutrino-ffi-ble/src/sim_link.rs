@@ -53,7 +53,7 @@ fn unhex32(addr: &[u8]) -> std::io::Result<NodeKey> {
         return Err(std::io::Error::other("sim link: address must be 64 hex"));
     }
     let mut key = [0u8; 32];
-    for (byte, pair) in key.iter_mut().zip(addr.chunks_exact(2)) {
+    for (byte, pair) in key.iter_mut().zip(addr.as_chunks::<2>().0) {
         let (Some(hi), Some(lo)) = (nibble(pair[0]), nibble(pair[1])) else {
             return Err(std::io::Error::other("sim link: bad hex in address"));
         };

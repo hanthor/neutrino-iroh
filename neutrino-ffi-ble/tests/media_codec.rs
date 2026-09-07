@@ -165,8 +165,8 @@ async fn run(frames: usize, loss: f64, seed: u64) -> Outcome {
     let pcm = sine_pcm(frames);
 
     // --- encode ahead of time so the send loop only paces the transport ---
-    let mut enc = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)
-        .expect("opus encoder");
+    let mut enc =
+        Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip).expect("opus encoder");
     enc.set_bitrate(opus::Bitrate::Bits(BITRATE))
         .expect("set bitrate");
     let packets: Vec<Vec<u8>> = (0..frames)
@@ -260,7 +260,10 @@ async fn run(frames: usize, loss: f64, seed: u64) -> Outcome {
     // --- score: skip the encoder startup transient (first 3 frames) ---
     let skip = 3 * FRAME_SAMPLES;
     let refn: Vec<f64> = pcm[skip..].iter().map(|&s| s as f64).collect();
-    let recf: Vec<f64> = out[skip.min(out.len())..].iter().map(|&s| s as f64).collect();
+    let recf: Vec<f64> = out[skip.min(out.len())..]
+        .iter()
+        .map(|&s| s as f64)
+        .collect();
     let (xcorr, lag) = best_xcorr(&refn, &recf, 2000);
     let snr = snr_db(&refn, &recf, lag);
 
@@ -286,8 +289,13 @@ async fn opus_codec_and_framing_round_trip_over_the_iroh_link() {
     let clean = run(FRAMES, 0.0, 0x9E3779B97F4A7C15).await;
     eprintln!(
         "clean       : offered {} delivered {} concealed {} out {} samples | xcorr {:.3} (lag {}) | SNR {:.1} dB",
-        clean.offered, clean.delivered, clean.concealed, clean.out_samples,
-        clean.xcorr, clean.lag, clean.snr_db
+        clean.offered,
+        clean.delivered,
+        clean.concealed,
+        clean.out_samples,
+        clean.xcorr,
+        clean.lag,
+        clean.snr_db
     );
 
     // Exact alignment invariant: one decoded frame per sequence, gaps included.
@@ -310,8 +318,13 @@ async fn opus_codec_and_framing_round_trip_over_the_iroh_link() {
     let lossy = run(FRAMES, 0.05, 0x1234_5678_9ABC_DEF0).await;
     eprintln!(
         "BLE-shaped  : offered {} delivered {} concealed {} out {} samples | xcorr {:.3} (lag {}) | SNR {:.1} dB",
-        lossy.offered, lossy.delivered, lossy.concealed, lossy.out_samples,
-        lossy.xcorr, lossy.lag, lossy.snr_db
+        lossy.offered,
+        lossy.delivered,
+        lossy.concealed,
+        lossy.out_samples,
+        lossy.xcorr,
+        lossy.lag,
+        lossy.snr_db
     );
 
     // The loss model must actually lose frames, or this run tests nothing.
@@ -340,6 +353,7 @@ async fn opus_codec_and_framing_round_trip_over_the_iroh_link() {
     assert!(
         lossy.xcorr <= clean.xcorr + 1e-6,
         "BLE-shaped correlation {:.3} should not exceed clean {:.3}",
-        lossy.xcorr, clean.xcorr
+        lossy.xcorr,
+        clean.xcorr
     );
 }

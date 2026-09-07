@@ -18,6 +18,7 @@
 //! Two profiles, one frame per packet at the codec's frame rate:
 //!   - opus voice: 32 kbit/s, 20 ms frames  (~80 B/frame, 50 fps)
 //!   - low-res video: 300 kbit/s, 30 fps     (~1250 B/frame)
+//!
 //! Each carries a u64 send-nanos header so the receiver measures one-way
 //! latency and, via a sequence number, loss.
 
@@ -187,13 +188,41 @@ async fn media_bitrates_sustain_over_the_iroh_link() {
     START.set(Instant::now()).ok();
     let profiles = [
         // Clean loopback: proves the software transport keeps up (must pass).
-        Profile { name: "opus-voice-32kbit clean", frame_bytes: 80, fps: 50, seconds: 3, loss: 0.0, extra_latency_ms: 0 },
-        Profile { name: "low-res-video-300kbit clean", frame_bytes: 1250, fps: 30, seconds: 3, loss: 0.0, extra_latency_ms: 0 },
+        Profile {
+            name: "opus-voice-32kbit clean",
+            frame_bytes: 80,
+            fps: 50,
+            seconds: 3,
+            loss: 0.0,
+            extra_latency_ms: 0,
+        },
+        Profile {
+            name: "low-res-video-300kbit clean",
+            frame_bytes: 1250,
+            fps: 30,
+            seconds: 3,
+            loss: 0.0,
+            extra_latency_ms: 0,
+        },
         // BLE-shaped: 5% loss, ~40ms added one-way latency. Reports how a
         // best-effort media stream degrades — a resilience signal for the
         // jitter buffer + opus PLC to absorb, not a hard gate.
-        Profile { name: "opus-voice-32kbit BLE-shaped", frame_bytes: 80, fps: 50, seconds: 3, loss: 0.05, extra_latency_ms: 40 },
-        Profile { name: "low-res-video-300kbit BLE-shaped", frame_bytes: 1250, fps: 30, seconds: 3, loss: 0.05, extra_latency_ms: 40 },
+        Profile {
+            name: "opus-voice-32kbit BLE-shaped",
+            frame_bytes: 80,
+            fps: 50,
+            seconds: 3,
+            loss: 0.05,
+            extra_latency_ms: 40,
+        },
+        Profile {
+            name: "low-res-video-300kbit BLE-shaped",
+            frame_bytes: 1250,
+            fps: 30,
+            seconds: 3,
+            loss: 0.05,
+            extra_latency_ms: 40,
+        },
     ];
     for p in &profiles {
         let r = run(p).await;
@@ -206,7 +235,12 @@ async fn media_bitrates_sustain_over_the_iroh_link() {
             "{}: offered {} sent {} recv {} model-loss {:.1}% goodput {:.0} kbit/s latency mean {:.1}ms max {:.1}ms",
             p.name,
             (p.frame_bytes * p.fps as usize) as f64 * 8.0 / 1000.0,
-            r.sent, r.received, loss, r.goodput_kbit, r.mean_latency_ms, r.max_latency_ms
+            r.sent,
+            r.received,
+            loss,
+            r.goodput_kbit,
+            r.mean_latency_ms,
+            r.max_latency_ms
         );
         if p.loss == 0.0 {
             // Clean rows are the real gate: the transport must keep up.
@@ -215,12 +249,19 @@ async fn media_bitrates_sustain_over_the_iroh_link() {
             } else {
                 100.0
             };
-            assert!(transport_loss < 2.0, "{}: transport loss {:.1}% too high", p.name, transport_loss);
+            assert!(
+                transport_loss < 2.0,
+                "{}: transport loss {:.1}% too high",
+                p.name,
+                transport_loss
+            );
             let offered = (p.frame_bytes * p.fps as usize) as f64 * 8.0 / 1000.0;
             assert!(
                 r.goodput_kbit > offered * 0.9,
                 "{}: goodput {:.0} kbit/s far below offered {:.0}",
-                p.name, r.goodput_kbit, offered
+                p.name,
+                r.goodput_kbit,
+                offered
             );
         } else {
             // Shaped rows: what actually arrives should track (1 - loss). This
@@ -228,7 +269,9 @@ async fn media_bitrates_sustain_over_the_iroh_link() {
             assert!(
                 r.received as f64 >= r.sent as f64 * 0.95,
                 "{}: transport dropped beyond the model ({} sent, {} recv)",
-                p.name, r.sent, r.received
+                p.name,
+                r.sent,
+                r.received
             );
         }
     }

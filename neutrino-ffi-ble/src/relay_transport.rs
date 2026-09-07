@@ -202,16 +202,17 @@ fn spawn_mdns_drain(
                     }
                     // Probe on first sight, and keep retrying — at a bounded
                     // rate — until one succeeds.
-                    let known_reachable = reachable
+                    let known_reachable =
+                        reachable.lock().map(|r| r.contains(&key)).unwrap_or(false);
+                    let strikes = failures
                         .lock()
-                        .map(|r| r.contains(&key))
-                        .unwrap_or(false);
-                    let strikes = failures.lock().map(|f| f.get(&key).copied().unwrap_or(0)).unwrap_or(0);
+                        .map(|f| f.get(&key).copied().unwrap_or(0))
+                        .unwrap_or(0);
                     let wait = PROBE_RETRY_INTERVAL
                         .saturating_mul(1u32 << strikes.min(6))
                         .min(PROBE_RETRY_CAP);
-                    let due = !known_reachable
-                        && probed.get(&key).is_none_or(|at| at.elapsed() >= wait);
+                    let due =
+                        !known_reachable && probed.get(&key).is_none_or(|at| at.elapsed() >= wait);
                     if due {
                         probed.insert(key, std::time::Instant::now());
                         // Dial it straight away rather than leaving the first
@@ -327,7 +328,7 @@ fn unhex32(addr: &[u8]) -> std::io::Result<NodeKey> {
         )));
     }
     let mut key = [0u8; 32];
-    for (byte, pair) in key.iter_mut().zip(addr.chunks_exact(2)) {
+    for (byte, pair) in key.iter_mut().zip(addr.as_chunks::<2>().0) {
         match (nibble(pair[0]), nibble(pair[1])) {
             (Some(hi), Some(lo)) => *byte = (hi << 4) | lo,
             _ => {

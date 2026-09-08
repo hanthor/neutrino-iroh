@@ -448,6 +448,17 @@ impl BleTransport {
         self.driver.set_manufacturer_data(data).await
     }
 
+    /// Toggle whether this node is discoverable over BLE at runtime (ADR 0008
+    /// hide-from-discovery). `false` stops advertising — a real hide: scanning
+    /// peers can no longer see this node's key UUID or its `node_id ‖ name`
+    /// discovery payload, and the driver latches the gate so an in-flight
+    /// display-name change or adapter cycle cannot silently un-hide it. `true`
+    /// re-advertises with the current config (the same advert built at startup).
+    /// Nodes start discoverable, so startup behaviour is unchanged.
+    pub async fn set_discoverable(&self, discoverable: bool) -> BleResult<()> {
+        self.driver.set_advertising_enabled(discoverable).await
+    }
+
     #[must_use]
     pub fn metrics(&self) -> BleMetricsSnapshot {
         BleMetricsSnapshot {

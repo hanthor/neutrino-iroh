@@ -422,7 +422,7 @@ impl<I: BleInterface> Driver<I> {
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use blew::gatt::service::GattService;
@@ -450,6 +450,12 @@ pub struct BlewDriver {
     // Mutable so the advertised manufacturer data (the local display name) can be
     // updated at runtime and re-advertised — see `set_manufacturer_data`.
     advertising_config: Mutex<AdvertisingConfig>,
+    /// Runtime discoverability gate (ADR 0008 hide-from-discovery). When `false`,
+    /// the node is hidden: `restart_advertising` becomes a no-op so no path
+    /// (a display-name change re-advertise, or the adapter-cycle recovery in
+    /// `execute`) can silently un-hide it. `set_advertising_enabled` is the only
+    /// writer; it starts `true` so startup advertises as before.
+    advertising_enabled: AtomicBool,
 }
 
 impl BlewDriver {
@@ -466,6 +472,24 @@ impl BlewDriver {
             channels_by_device: Mutex::new(HashMap::new()),
             services,
             advertising_config: Mutex::new(advertising_config),
+            advertising_enabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Start or stop BLE advertising at runtime (ADR 0008 hide-from-discovery).
+    ///
+    /// `false` is a *real* hide: it stops advertising so scanning peers no longer
+    /// see this node's key UUID or discovery payload, and latches the gate so
+    /// `restart_advertising` stays a no-op — a concurrent display-name change or
+    /// an adapter off/on cycle cannot un-hide the node. `true` clears the gate and
+    /// re-advertises with the current config (the same advert used at startup).
+    pub async fn set_advertising_enabled(&self, enabled: bool) -> crate::error::BleResult<()> {
+        self.advertising_enabled.store(enabled, Ordering::SeqCst);
+        if enabled {
+            self.restart_advertising().await
+        } else {
+            self.peripheral.stop_advertising().await?;
+            Ok(())
         }
     }
 
@@ -627,6 +651,15 @@ impl BleInterface for BlewDriver {
     }
 
     async fn restart_advertising(&self) -> crate::error::BleResult<()> {
+        // Hidden node (ADR 0008): stay off the air. Every re-advertise funnels
+        // through here — the runtime display-name change and the adapter-cycle
+        // recovery both call it — so gating here keeps a hidden node hidden
+        // across those events. `set_manufacturer_data` still updates the stored
+        // config under the mutex, so the pending name goes out when unhidden.
+        if !self.advertising_enabled.load(Ordering::SeqCst) {
+            tracing::debug!("restart_advertising suppressed: node is hidden (not discoverable)");
+            return Ok(());
+        }
         if let Err(e) = self.peripheral.stop_advertising().await {
             tracing::debug!(?e, "restart_advertising: stop_advertising ignored");
         }

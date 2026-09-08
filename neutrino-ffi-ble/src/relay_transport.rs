@@ -281,6 +281,57 @@ fn spawn_mdns_drain(
     });
 }
 
+/// Process-global discoverability toggle for the local BLE advert (ADR 0008
+/// hide-from-discovery, issue #47). The FFI [`crate::set_discoverable`] pulses
+/// this; the drain spawned in [`IrohTransport::bind`] applies each change to the
+/// live transport. A process global — like the rustls provider and the JNI
+/// bootstrap this crate already installs — because the FFI toggle has no handle
+/// to the `BleTransport`, which is built lazily inside the link factory. Retains
+/// the latest value (via `send_replace`), so a toggle that arrives before the
+/// transport exists is honoured once the drain subscribes. Defaults to `true`:
+/// startup stays discoverable.
+#[cfg(feature = "ble")]
+static DISCOVERABLE: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(true).0);
+
+/// Set the desired BLE discoverability. Sync at the FFI boundary; the async
+/// re-advertise/stop happens on the drain task. `send_replace` ignores "no
+/// receivers" (drain not spawned yet, or transport already dropped) while
+/// retaining the value for a drain that subscribes later.
+#[cfg(feature = "ble")]
+pub(crate) fn set_discoverable(discoverable: bool) {
+    DISCOVERABLE.send_replace(discoverable);
+    tracing::info!(discoverable, "BLE discoverability toggled");
+}
+
+/// Apply discoverability changes to the live transport. Holds a `Weak` (like
+/// [`spawn_mdns_drain`]) so it never keeps the transport alive; it exits once the
+/// transport is dropped. The initial value is applied only when it is `false` —
+/// a hide toggle that landed before bind — so an untouched startup keeps the
+/// default advert without a spurious stop/start.
+#[cfg(feature = "ble")]
+fn spawn_discoverable_drain(ble: std::sync::Weak<iroh_ble_transport::transport::BleTransport>) {
+    tokio::spawn(async move {
+        let mut rx = DISCOVERABLE.subscribe();
+        if !*rx.borrow_and_update()
+            && let Some(ble) = ble.upgrade()
+            && let Err(e) = ble.set_discoverable(false).await
+        {
+            warn!(error = %e, "applying initial (pre-bind) hide toggle failed");
+        }
+        while rx.changed().await.is_ok() {
+            let want = *rx.borrow_and_update();
+            // No live transport left → nothing to toggle; end the drain. The
+            // global sender never closes (one-process Android lifecycle), so
+            // this Weak upgrade is what ends the task, not the watch closing.
+            let Some(ble) = ble.upgrade() else { break };
+            if let Err(e) = ble.set_discoverable(want).await {
+                warn!(error = %e, discoverable = want, "applying discoverability toggle failed");
+            }
+        }
+    });
+}
+
 /// Re-advertise the local display name whenever it changes (`PUT
 /// /profile/.../displayname` pulses the watch).
 #[cfg(feature = "ble")]
@@ -514,6 +565,9 @@ impl IrohTransport {
                 commands.clone(),
             );
             spawn_readvertise(Arc::clone(&ble), name_rx);
+            // Apply the FFI hide-from-discovery toggle (ADR 0008) to this live
+            // transport. Weak, so the drain does not keep the transport alive.
+            spawn_discoverable_drain(Arc::downgrade(&ble));
             let ble: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble;
             tracing::info!("BLE dedup hook wired: verified-endpoint events -> registry");
             builder

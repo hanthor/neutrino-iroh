@@ -74,6 +74,26 @@ pub fn start_ble(mut config: neutrino::NeutrinoConfig) -> neutrino::NeutrinoHand
     neutrino::start_with(config, None, None, Some(factory))
 }
 
+/// Toggle whether this node is discoverable over the BLE mesh (ADR 0008
+/// hide-from-discovery, issue #47).
+///
+/// `false` stops advertising, so scanning peers no longer see this node's key
+/// UUID or its `node_id ‖ display_name` discovery payload — a real hide, not
+/// just a blank name. `true` restores the default discoverable advert. The
+/// change is applied to the running node the current [`start_ble`] call built;
+/// it takes effect once the BLE transport is up, and a toggle sent before then
+/// is retained and applied on start. Nodes start discoverable.
+///
+/// Additive to the FFI surface (safe to ship in a later `.aar`). Off the `ble`
+/// feature (desktop/CI builds) this is a no-op: there is no BLE advert to toggle.
+#[uniffi::export]
+pub fn set_discoverable(discoverable: bool) {
+    #[cfg(feature = "ble")]
+    relay_transport::set_discoverable(discoverable);
+    #[cfg(not(feature = "ble"))]
+    let _ = discoverable;
+}
+
 /// Start the embedded homeserver with the iroh medium on a machine that is not
 /// a phone — same composition as [`start_ble`], minus BLE.
 ///

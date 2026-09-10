@@ -19,7 +19,16 @@ uniffi::setup_scaffolding!("neutrino_ble");
 
 #[cfg(feature = "ble")]
 mod ble_android;
-mod relay_transport;
+/// MatrixRTC `call.member` signalling model for a mesh/iroh focus (pure data,
+/// no network; companion ADR 0007).
+pub mod call_member;
+/// The iroh transport itself. Public for one reason: its media surface
+/// ([`relay_transport::IrohTransport::connect_media`] /
+/// [`relay_transport::IrohTransport::accept_media`], [`relay_transport::MediaConnection`])
+/// is what a call rides on, and the integration test that proves relay and
+/// media share one endpoint (`tests/media_shared_endpoint.rs`) has to drive
+/// it from outside the crate. Not part of the uniffi surface.
+pub mod relay_transport;
 mod sim_link;
 
 use relay_transport::{IrohTransport, RELAY_BIND};

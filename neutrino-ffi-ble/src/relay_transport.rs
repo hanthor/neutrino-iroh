@@ -24,6 +24,15 @@
 //! The endpoint still binds its own ephemeral loopback UDP socket for QUIC
 //! transport (see [`RELAY_BIND`]); that is iroh-internal and not a peer data
 //! path.
+//!
+//! The same endpoint also speaks a second ALPN, [`MEDIA_ALPN`], for real-time
+//! media (companion ADR 0007, issue #13): a call is a *separate* QUIC
+//! connection to the same peer, negotiated by ALPN at the handshake, so its
+//! unreliable datagrams never enter the federation queue and federation
+//! blocks never land in a jitter buffer — while both ride the one endpoint,
+//! and therefore the one BLE link (GATT→L2CAP-upgraded) and the one node
+//! identity. See [`IrohTransport::connect_media`] / [`accept_media`]
+//! (IrohTransport::accept_media) and [`MediaConnection`].
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -53,6 +62,30 @@ pub(crate) const RELAY_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::U
 
 /// ALPN for the federation datagram link.
 const RELAY_ALPN: &[u8] = b"neutrino/iroh-relay/0";
+
+/// ALPN for real-time media on the shared endpoint (companion ADR 0007).
+///
+/// Registered alongside [`RELAY_ALPN`] on the one iroh endpoint the federation
+/// medium binds, so a media connection inherits everything that endpoint has:
+/// the node identity, discovery, the BLE custom transport and its GATT→L2CAP
+/// CoC upgrade. The accept loop routes an incoming connection by the ALPN the
+/// peer negotiated — relay connections into the [`DatagramLink`] tables, media
+/// connections to [`IrohTransport::accept_media`] — and never mixes the two.
+///
+/// Deliberately NOT `neutrino/media-probe/0`, the ALPN the standalone probes in
+/// `tests/media_{throughput,codec,duplex}.rs` speak on their own loopback
+/// endpoints. Those probes measure codec + framing in isolation and must keep
+/// working without the federation transport, so they keep their own name; a
+/// probe endpoint must also never look like a shipping media peer to a real
+/// node (or vice versa). The `/0` is the wire-format version of the media
+/// framing (u64 little-endian sequence header + one opus packet per datagram,
+/// as the probes established); bump it, not the relay ALPN, when that changes.
+pub const MEDIA_ALPN: &[u8] = b"neutrino/media/0";
+
+/// Queued inbound media connections awaiting [`IrohTransport::accept_media`].
+/// Small on purpose: a call the application never picks up should be refused
+/// at the handshake, not held open indefinitely.
+const MEDIA_ACCEPT_CAPACITY: usize = 4;
 
 /// Forward BLE-discovered peers into the homeserver's discovery registry. Each
 /// transport snapshot replaces the registry set: peers are keyed by
@@ -442,7 +475,7 @@ const INBOUND_CAPACITY: usize = 256;
 /// Send-side route table: the connection to use for sending to each peer.
 type ConnMap = Arc<AsyncMutex<HashMap<NodeKey, Connection>>>;
 
-pub(crate) struct IrohTransport {
+pub struct IrohTransport {
     endpoint: Endpoint,
     conns: ConnMap,
     /// Where to reach a peer. Seeded out of band — service discovery on device,
@@ -451,6 +484,11 @@ pub(crate) struct IrohTransport {
     addrs: Mutex<HashMap<NodeKey, EndpointAddr>>,
     inbound_tx: mpsc::Sender<(LinkAddr, Vec<u8>)>,
     inbound_rx: AsyncMutex<mpsc::Receiver<(LinkAddr, Vec<u8>)>>,
+    /// Inbound media connections (peers that dialed us on [`MEDIA_ALPN`]),
+    /// handed out by [`accept_media`](Self::accept_media). Separate from the
+    /// relay `conns` table on purpose: a call is owned by whoever accepted it,
+    /// not cached and reused by the federation send path.
+    media_rx: AsyncMutex<mpsc::Receiver<MediaConnection>>,
     /// The accept-loop task. Aborted on drop so the endpoint (and its UDP
     /// socket) can close — the loop captures only clones, never an `Arc<Self>`,
     /// so it doesn't keep this transport alive (which would leak an endpoint per
@@ -466,7 +504,7 @@ impl IrohTransport {
     /// watch drives the BLE advertisement (+ re-advertise on change), its
     /// registry receives scanned peers, and its command sender is pulsed on
     /// peer appearance; all three are unused off the `ble` feature.
-    pub(crate) async fn bind(
+    pub async fn bind(
         ctx: LinkContext,
         bind_addr: SocketAddr,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
@@ -510,7 +548,8 @@ impl IrohTransport {
         let builder = Endpoint::builder(Minimal)
             .relay_mode(RelayMode::Disabled)
             .secret_key(secret_key)
-            .alpns(vec![RELAY_ALPN.to_vec()])
+            // Both protocols on the one endpoint; see `MEDIA_ALPN`.
+            .alpns(vec![RELAY_ALPN.to_vec(), MEDIA_ALPN.to_vec()])
             .transport_config(transport_config);
 
         // On the embedded (Android) target, add the BLE custom transport
@@ -589,6 +628,7 @@ impl IrohTransport {
         );
 
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let (media_tx, media_rx) = mpsc::channel(MEDIA_ACCEPT_CAPACITY);
         let conns: ConnMap = Arc::new(AsyncMutex::new(HashMap::new()));
         // Spawn the accept loop with clones (endpoint/conns/tx), NOT an
         // `Arc<Self>` — so the transport isn't kept alive by its own loop.
@@ -596,6 +636,7 @@ impl IrohTransport {
             endpoint.clone(),
             conns.clone(),
             inbound_tx.clone(),
+            media_tx,
         ));
         let transport = Arc::new(Self {
             endpoint,
@@ -603,6 +644,7 @@ impl IrohTransport {
             addrs: Mutex::new(HashMap::new()),
             inbound_tx,
             inbound_rx: AsyncMutex::new(inbound_rx),
+            media_rx: AsyncMutex::new(media_rx),
             accept_task: Mutex::new(Some(accept_task)),
         });
 
@@ -636,8 +678,7 @@ impl IrohTransport {
     }
 
     /// This node's identity (its iroh endpoint id) as a [`NodeKey`].
-    #[allow(dead_code)]
-    pub(crate) fn node_key(&self) -> NodeKey {
+    pub fn node_key(&self) -> NodeKey {
         *self.endpoint.id().as_bytes()
     }
 
@@ -650,8 +691,7 @@ impl IrohTransport {
     }
 
     /// The sockets this endpoint is bound to.
-    #[allow(dead_code)]
-    pub(crate) fn bound_sockets(&self) -> Vec<SocketAddr> {
+    pub fn bound_sockets(&self) -> Vec<SocketAddr> {
         self.endpoint.bound_sockets()
     }
 
@@ -717,16 +757,11 @@ impl IrohTransport {
         });
     }
 
-    /// A live connection to `dst`, dialing (and starting its reader) on a miss.
-    async fn connection(&self, dst: NodeKey) -> std::io::Result<Connection> {
-        {
-            let conns = self.conns.lock().await;
-            if let Some(conn) = conns.get(&dst)
-                && conn.close_reason().is_none()
-            {
-                return Ok(conn.clone());
-            }
-        }
+    /// Where to dial `dst`: its seeded address, or (with the BLE transport
+    /// present) the bare id for the endpoint's `address_lookup` to resolve.
+    /// Shared by the relay and media dial paths so both reach a peer the same
+    /// way — over the same discovered BLE pipe or LAN address.
+    fn dial_addr(&self, dst: NodeKey) -> std::io::Result<EndpointAddr> {
         let seeded = self
             .addrs
             .lock()
@@ -751,6 +786,20 @@ impl IrohTransport {
                 return Err(std::io::Error::other("link: no known address for peer"));
             }
         };
+        Ok(addr)
+    }
+
+    /// A live connection to `dst`, dialing (and starting its reader) on a miss.
+    async fn connection(&self, dst: NodeKey) -> std::io::Result<Connection> {
+        {
+            let conns = self.conns.lock().await;
+            if let Some(conn) = conns.get(&dst)
+                && conn.close_reason().is_none()
+            {
+                return Ok(conn.clone());
+            }
+        }
+        let addr = self.dial_addr(dst)?;
         // Info, not debug: this is the load-bearing federation hop, and a dial that
         // never resolves is the failure we most need to see. `peer` is the id we
         // dial; `addrs` is empty on device (id-only, resolved via BLE discovery).
@@ -804,6 +853,107 @@ impl IrohTransport {
     }
 }
 
+impl IrohTransport {
+    /// Open a media connection to `dst` on [`MEDIA_ALPN`], over this — the
+    /// federation — endpoint.
+    ///
+    /// The peer is reached exactly as a federation dial reaches it (seeded
+    /// address, else BLE discovery), so on device the call rides the same
+    /// GATT→L2CAP-upgraded BLE link that federation already brought up, with
+    /// the same 30 s [`CONNECT_TIMEOUT`]. Unlike [`DatagramLink::send`]'s
+    /// connections this one is NOT cached: a call's connection belongs to the
+    /// call, is closed when the call ends, and a second call dials afresh.
+    /// The peer must be listening via [`accept_media`](Self::accept_media), or
+    /// the handshake is refused.
+    pub async fn connect_media(&self, dst: NodeKey) -> std::io::Result<MediaConnection> {
+        let addr = self.dial_addr(dst)?;
+        let peer = addr.id;
+        tracing::info!(%peer, addrs = ?addr.addrs, "media: dialing peer on the shared endpoint");
+        match tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(addr, MEDIA_ALPN)).await {
+            Ok(Ok(conn)) => {
+                tracing::info!(%peer, "media: connection established");
+                Ok(MediaConnection { conn })
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%peer, error = %e, "media: connect to peer failed");
+                Err(std::io::Error::other(format!(
+                    "media connect to {peer}: {e}"
+                )))
+            }
+            Err(_) => {
+                tracing::warn!(%peer, timeout = ?CONNECT_TIMEOUT, "media: connect to peer timed out");
+                Err(std::io::Error::other(format!(
+                    "media connect to {peer} timed out after {CONNECT_TIMEOUT:?}"
+                )))
+            }
+        }
+    }
+
+    /// The next inbound media connection — a peer that dialed this node on
+    /// [`MEDIA_ALPN`]. `None` once the transport is shutting down.
+    ///
+    /// Whoever calls this owns the call: the transport neither reads from nor
+    /// caches media connections. A connection nobody accepts is closed at the
+    /// door once [`MEDIA_ACCEPT_CAPACITY`] are waiting.
+    pub async fn accept_media(&self) -> Option<MediaConnection> {
+        self.media_rx.lock().await.recv().await
+    }
+}
+
+/// One media leg between this node and a peer: a QUIC connection on
+/// [`MEDIA_ALPN`] over the shared endpoint, carrying unreliable datagrams —
+/// the RTP contract (a late frame is worthless, so drop beats retransmit).
+/// Cloneable, and every method takes `&self`, so a send task and a receive
+/// task can drive the same leg concurrently (full duplex, as
+/// `tests/media_duplex.rs` proved for a bare `Connection`).
+///
+/// Framing is the caller's: this hands datagrams through verbatim. The
+/// established convention (`/0` in the ALPN) is a u64 little-endian sequence
+/// header followed by one opus packet.
+#[derive(Clone, Debug)]
+pub struct MediaConnection {
+    conn: Connection,
+}
+
+impl MediaConnection {
+    /// The peer's node id, authenticated by the QUIC handshake.
+    pub fn remote_node(&self) -> NodeKey {
+        *self.conn.remote_id().as_bytes()
+    }
+
+    /// Queue one media frame as an unreliable datagram. Fails if the frame
+    /// exceeds [`max_frame_size`](Self::max_frame_size) or the leg is closed.
+    pub fn send_frame(&self, frame: Bytes) -> std::io::Result<()> {
+        self.conn
+            .send_datagram(frame)
+            .map_err(|e| std::io::Error::other(format!("media send_datagram: {e}")))
+    }
+
+    /// The next inbound media frame. Errors only once the leg is closed.
+    pub async fn recv_frame(&self) -> std::io::Result<Bytes> {
+        self.conn
+            .read_datagram()
+            .await
+            .map_err(|e| std::io::Error::other(format!("media read_datagram: {e}")))
+    }
+
+    /// Largest frame the path currently carries in one datagram (opus voice
+    /// frames are ~60–100 B, far under any QUIC path's limit).
+    pub fn max_frame_size(&self) -> Option<usize> {
+        self.conn.max_datagram_size()
+    }
+
+    /// Hang up. Both ends' pending `recv_frame`s error out.
+    pub fn close(&self) {
+        self.conn.close(VarInt::from_u32(0), b"hangup");
+    }
+
+    /// Why the leg closed, if it has.
+    pub fn close_reason(&self) -> Option<String> {
+        self.conn.close_reason().map(|e| e.to_string())
+    }
+}
+
 impl Drop for IrohTransport {
     fn drop(&mut self) {
         // Stop accepting so the endpoint (and its UDP socket) can close. The
@@ -822,18 +972,51 @@ impl Drop for IrohTransport {
 
 /// Accept inbound connections (with clones of the shared state, not an
 /// `Arc<IrohTransport>`, so the loop never keeps the transport alive).
+///
+/// Routes each accepted connection by the ALPN the peer negotiated: relay
+/// connections join the [`DatagramLink`] tables, media connections queue for
+/// [`IrohTransport::accept_media`]. The endpoint only offers the two ALPNs it
+/// registered, so anything else here is an iroh invariant violation — closed,
+/// never adopted.
 async fn accept_loop(
     endpoint: Endpoint,
     conns: ConnMap,
     inbound_tx: mpsc::Sender<(LinkAddr, Vec<u8>)>,
+    media_tx: mpsc::Sender<MediaConnection>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let conns = conns.clone();
         let inbound_tx = inbound_tx.clone();
+        let media_tx = media_tx.clone();
         tokio::spawn(async move {
-            match incoming.await {
-                Ok(conn) => adopt(conn, conns, inbound_tx).await,
-                Err(err) => warn!(?err, "datagram link: inbound connection failed"),
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    warn!(?err, "datagram link: inbound connection failed");
+                    return;
+                }
+            };
+            match conn.alpn() {
+                RELAY_ALPN => adopt(conn, conns, inbound_tx).await,
+                MEDIA_ALPN => {
+                    let peer = conn.remote_id();
+                    // Best-effort at the door: nobody accepting calls (channel
+                    // full, or the transport is going away) means refuse now,
+                    // not hold a QUIC connection open to a caller that will
+                    // hear nothing.
+                    if let Err(e) = media_tx.try_send(MediaConnection { conn: conn.clone() }) {
+                        warn!(%peer, "media: no listener for inbound call, refusing");
+                        e.into_inner()
+                            .conn
+                            .close(VarInt::from_u32(1), b"no media listener");
+                    } else {
+                        tracing::info!(%peer, "media: inbound connection accepted");
+                    }
+                }
+                other => {
+                    warn!(alpn = ?String::from_utf8_lossy(other), "inbound connection on unregistered ALPN, closing");
+                    conn.close(VarInt::from_u32(1), b"unknown alpn");
+                }
             }
         });
     }

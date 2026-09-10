@@ -64,6 +64,11 @@ n0-future = "0.3"
 # its federation client (which would otherwise panic). rustls + ring are
 # already transitive deps of iroh, so this only exposes them.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# The MatrixRTC `call.member` model (src/call_member.rs) is serde-shaped JSON.
+# Both crates are already in the tree transitively (neutrino, iroh), so this
+# adds no compile cost and no new download.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Android-only JNI bootstrap for blew (see src/ble_android.rs). `blew` is pulled
 # in directly so we can call its `init_jvm`; cargo unifies it with the copy

@@ -3032,6 +3032,8 @@ dependencies = [
  "neutrino-main",
  "opus",
  "rustls 0.23.41",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uniffi",
